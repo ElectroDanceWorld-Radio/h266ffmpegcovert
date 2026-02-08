@@ -4,6 +4,8 @@
 # SCRIPT DE COMPRESION H.266 VVC - MAXIMA EFICIENCIA
 # ====================================================
 
+##con picos de 41% sin hacer restauracion de conversion 
+
 # CONFIGURACION POR PARAMETROS
 VIDEO_INPUT="${1:-/home/carlos/Descargas/Conversion ffmpeg/Noturnity Sesions Special 2 Audio HD.mp4}"
 VIDEO_OUTPUT="${2:-/home/carlos/Descargas/Conversion ffmpeg/Noturnity Sesions Special 2 Audio HD266.mp4}"
@@ -31,7 +33,7 @@ BACKUP_EVERY=5
 
 # CONFIGURACION AUDIO
 AUDIO_ENCODER="libopus"
-AUDIO_BITRATE="256k"  # Cambiado a 256k como solicitaste
+AUDIO_BITRATE="256k"
 AUDIO_CHANNELS="2"
 
 # =================================================================
@@ -61,25 +63,30 @@ log_error() {
 detect_hw_accel() {
     log_info "Detectando aceleracion por hardware..."
     
-    # Suprimir errores MPP (Media Process Platform)
-    export MPP_LOG_LEVEL=0  # Silenciar MPP
+    # Lista de aceleradores a probar
+    local hw_accels=("cuda" "vaapi" "dxva2" "d3d11va")
     
-    local hw_accels=("cuda" "vaapi" "dxva2" "d3d11va" "auto")
+    # Primero probar sin aceleracion
+    log_info "Probando sin aceleracion..."
+    if timeout 5 ffmpeg -loglevel quiet -i "$VIDEO_INPUT" -t 1 -f null - 2>/dev/null; then
+        log_success "Software funcionando"
+        echo ""
+        return 0
+    fi
     
+    # Probar cada acelerador
     for accel in "${hw_accels[@]}"; do
         log_info "Probando $accel..."
-        
-        # Redirigir stderr para suprimir errores MPP
-        if ffmpeg -hwaccel "$accel" -i "$VIDEO_INPUT" -t 0.5 -f null - 2>/dev/null | grep -v "mpp\|MPP"; then
+        if timeout 5 ffmpeg -hwaccel "$accel" -loglevel quiet -i "$VIDEO_INPUT" -t 1 -f null - 2>/dev/null; then
             log_success "Aceleracion $accel disponible"
             echo "$accel"
             return 0
         fi
     done
     
-    log_warning "No se encontro aceleracion por hardware, usando software"
+    log_warning "Usando software (fallback)"
     echo ""
-    return 1
+    return 0
 }
 
 check_vvc_support() {
@@ -89,10 +96,6 @@ check_vvc_support() {
         log_error "vvencapp no encontrado."
         log_error "Instala VVC encoder desde: https://github.com/fraunhoferhhi/vvenc"
         return 1
-    fi
-    
-    if ! ffmpeg -encoders 2>/dev/null | grep -q "libvvenc"; then
-        log_warning "libvvenc no esta disponible en FFmpeg"
     fi
     
     log_success "VVC encoder disponible"
@@ -121,184 +124,149 @@ create_segments() {
     log_info "Creando segmentos de ${duration}s..."
     
     # Verificar si ya hay segmentos
-    local existing_segments=$(ls -1 segment_*.mp4 2>/dev/null | head -1)
-    if [ -n "$existing_segments" ]; then
+    if ls segment_*.mp4 1> /dev/null 2>&1; then
         local count=$(ls segment_*.mp4 2>/dev/null | wc -l)
         log_info "Segmentos ya existen ($count encontrados), saltando creacion"
         return 0
     fi
     
-    local hw_accel=""
-    if [ -n "$HW_ACCEL" ]; then
-        hw_accel="-hwaccel $HW_ACCEL"
-    fi
+    # Método 1: Simple sin redireccion de logs
+    log_info "Intentando metodo simple..."
     
-    log_info "Ejecutando comando de creacion de segmentos..."
-    
-    # Explicacion de -avoid_negative_ts make_zero:
-    # FFmpeg intenta evitar timestamps negativos en los segmentos
-    # make_zero: Hace que el primer timestamp sea 0 en cada segmento
-    # Esto es importante para que los segmentos sean independientes
-    
-    # Crear archivo de log para capturar salida
-    local log_file="segment_creation.log"
-    
-    # Comando simplificado sin redireccion compleja
-    # Usamos -loglevel error para reducir salida y capturar solo errores
-    local cmd="ffmpeg -loglevel error $hw_accel \
-        -i \"$input\" \
+    # Usar un comando simple sin logs
+    ffmpeg -loglevel quiet -i "$input" \
         -c copy \
-        -map 0 \
         -f segment \
-        -segment_time $duration \
+        -segment_time "$duration" \
         -segment_format mp4 \
         -reset_timestamps 1 \
         -segment_start_number 0 \
-        -avoid_negative_ts make_zero \
-        \"segment_%03d.mp4\" 2>&1"
+        "segment_%03d.mp4" 2>/dev/null
     
-    log_info "Ejecutando: ffmpeg -i \"$input\" -c copy -f segment -segment_time $duration ..."
-    
-    # Ejecutar y capturar salida
-    eval "$cmd" > "$log_file" 2>&1
-    local exit_code=$?
-    
-    # Contar segmentos creados
     local count=$(ls segment_*.mp4 2>/dev/null | wc -l)
     
     if [ $count -gt 0 ]; then
         log_success "Creados $count segmentos"
-        # Mostrar algunos segmentos creados
-        ls -la segment_*.mp4 2>/dev/null | head -3 | while read line; do
-            log_info "  $line"
-        done
-        rm -f "$log_file" 2>/dev/null
         return 0
-    else
-        # Mostrar error si hubo
-        if [ -f "$log_file" ]; then
-            log_error "Error al crear segmentos. Log:"
-            grep -i "error\|fail\|invalid" "$log_file" | head -5 | while read line; do
-                log_error "  $line"
-            done
-        fi
-        
-        # Intentar metodo alternativo MAS SIMPLE
-        log_info "Intentando metodo alternativo simplificado..."
-        
-        # Método 1: Sin -avoid_negative_ts
-        ffmpeg -loglevel error -i "$input" \
+    fi
+    
+    # Método 2: Con redireccion a archivo
+    log_info "Intentando con redireccion de errores..."
+    
+    local temp_log="ffmpeg_segment.log"
+    
+    # Usar comando sin interpretar timestamps
+    {
+        ffmpeg -i "$input" \
             -c copy \
             -f segment \
             -segment_time "$duration" \
             -segment_format mp4 \
             -reset_timestamps 1 \
-            "segment_%03d.mp4" 2>&1 | grep -v "mpp\|MPP" || true
+            -segment_start_number 0 \
+            "segment_%03d.mp4" 2>"$temp_log"
+    } 2>/dev/null
+    
+    local count=$(ls segment_*.mp4 2>/dev/null | wc -l)
+    
+    if [ $count -gt 0 ]; then
+        log_success "Creados $count segmentos"
+        rm -f "$temp_log" 2>/dev/null
+        return 0
+    fi
+    
+    # Método 3: Crear segmentos uno por uno
+    log_info "Creando segmentos manualmente..."
+    
+    # Obtener duracion total
+    local total_duration=$(ffprobe -v error -show_entries format=duration \
+        -of default=noprint_wrappers=1:nokey=1 "$input" 2>/dev/null | cut -d. -f1)
+    
+    if [ -z "$total_duration" ] || [ "$total_duration" -le 0 ]; then
+        total_duration=2166
+    fi
+    
+    local segment_count=$(( (total_duration + duration - 1) / duration ))
+    log_info "Duracion total: ${total_duration}s, creando $segment_count segmentos..."
+    
+    local created_count=0
+    
+    for ((i=0; i<segment_count; i++)); do
+        local start=$((i * duration))
+        local segment_name=$(printf "segment_%03d.mp4" $i)
         
-        local alt_count=$(ls segment_*.mp4 2>/dev/null | wc -l)
-        if [ $alt_count -gt 0 ]; then
-            log_success "Creados $alt_count segmentos (metodo alternativo 1)"
-            return 0
+        # Mostrar progreso cada 10 segmentos
+        if [ $((i % 10)) -eq 0 ]; then
+            log_info "Creando segmento $((i+1))/$segment_count..."
         fi
         
-        # Método 2: Usando force_key_frames para cortes precisos
-        log_info "Intentando con cortes en keyframes..."
-        ffmpeg -loglevel error -i "$input" \
+        # Comando simple sin logs
+        ffmpeg -loglevel quiet -i "$input" \
+            -ss "$start" \
+            -t "$duration" \
             -c copy \
-            -force_key_frames "expr:gte(t,n_forced*$duration)" \
-            -f segment \
-            -segment_time "$duration" \
-            -segment_format mp4 \
-            "seg_%03d.mp4" 2>&1 | grep -v "mpp\|MPP" || true
+            -avoid_negative_ts make_zero \
+            -y "$segment_name" 2>/dev/null
         
-        # Renombrar si se crearon con otro nombre
-        if [ -f "seg_000.mp4" ]; then
-            mv seg_*.mp4 segment_*.mp4 2>/dev/null
-            local alt_count=$(ls segment_*.mp4 2>/dev/null | wc -l)
-            log_success "Creados $alt_count segmentos (con keyframes forzados)"
-            return 0
+        # Verificar si se creo el segmento
+        if [ -f "$segment_name" ] && [ -s "$segment_name" ]; then
+            ((created_count++))
+        else
+            rm -f "$segment_name" 2>/dev/null
         fi
-        
-        # Método 3: Crear segmentos manualmente
-        log_info "Intentando creacion manual de segmentos..."
-        
-        # Obtener duracion total
-        local total_duration=$(ffprobe -v error -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 "$input" 2>/dev/null | cut -d. -f1)
-        
-        if [ -n "$total_duration" ] && [ "$total_duration" -gt 0 ]; then
-            local segment_count=$(( (total_duration + duration - 1) / duration ))
-            log_info "Duracion total: ${total_duration}s, segmentos estimados: $segment_count"
-            
-            for ((i=0; i<segment_count; i++)); do
-                local start=$((i * duration))
-                local segment_name=$(printf "segment_%03d.mp4" $i)
-                
-                ffmpeg -loglevel error -i "$input" \
-                    -ss "$start" \
-                    -t "$duration" \
-                    -c copy \
-                    -avoid_negative_ts make_zero \
-                    -y "$segment_name" 2>&1 | grep -v "mpp\|MPP" || true
-                
-                # Verificar si se creo el segmento
-                if [ -f "$segment_name" ] && [ -s "$segment_name" ]; then
-                    log_info "  Creado: $segment_name"
-                else
-                    rm -f "$segment_name" 2>/dev/null
-                fi
-            done
-            
-            local final_count=$(ls segment_*.mp4 2>/dev/null | wc -l)
-            if [ $final_count -gt 0 ]; then
-                log_success "Creados $final_count segmentos (metodo manual)"
-                return 0
-            fi
-        fi
-        
+    done
+    
+    if [ $created_count -gt 0 ]; then
+        log_success "Creados $created_count/$segment_count segmentos"
+        return 0
+    else
+        log_error "No se pudieron crear segmentos"
         return 1
     fi
 }
 
-convert_segment_vvc() {
+build_vvc_command() {
     local input="$1"
     local output="$2"
-    local attempt="$3"
     
-    local log_file="log_$(basename "$input" .mp4)_attempt${attempt}.txt"
-    local start_time=$(date +%s)
+    local vvenc_cmd="vvencapp"
     
-    log_info "Convertiendo: $(basename "$input") (intento $attempt)"
+    local params=(
+        "--input \"$input\""
+        "--output \"$output\""
+        "--preset $VVC_PRESET"
+        "--qp $QP"
+        "--threads $THREADS"
+        "--intraperiod $INTRA_PERIOD"
+        "--qpa $QPA"
+        "--internal-bitdepth $INTERNAL_BITDEPTH"
+        "--mtprofile $MT_PROFILE"
+        "--ifp $IFP"
+        "--tiles $TILES"
+        "--profile main_10"
+        "--level auto"
+        "--decodedpicturehash 1"
+    )
     
-    local vvc_cmd=$(build_vvc_command "$input" "$output")
+    local additional_params=(
+        "RateControl=0" #suprimir parametro no reconocido util en 2 pasadas
+        "SAO=1"
+        "ALF=1"
+        "Affine=1"
+        "MCTF=1"
+        "DepQuant=1"
+        "CIIP=1"
+        "GPM=1"
+        "MRL=1"
+        "MIP=on"
+        "ISP=on"
+        "TransformSkip=on"
+        "JointCbCr=1"
+    )
     
-    # Ejecutar con redireccion de errores MPP
-    eval "$vvc_cmd" 2>&1 | grep -v "mpp\|MPP" > "$log_file"
-    local exit_code=${PIPESTATUS[0]}
+    local additional_str=$(IFS=:; echo "${additional_params[*]}")
     
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    
-    if [ $exit_code -eq 0 ] && [ -f "$output" ] && [ -s "$output" ]; then
-        # Verificar que el archivo sea un video valido
-        local video_info=$(ffprobe -v error -show_format -show_streams "$output" 2>/dev/null)
-        if [ -n "$video_info" ]; then
-            log_success "Convertido en ${duration}s"
-            rm -f "$log_file"
-            return 0
-        fi
-    fi
-    
-    # Mostrar error si existe
-    if [ -f "$log_file" ]; then
-        local error_msg=$(grep -i "error\|fail\|invalid\|unsupported" "$log_file" | head -3)
-        if [ -n "$error_msg" ]; then
-            log_error "Error: $error_msg"
-        fi
-    fi
-    
-    log_error "Fallo en conversion (${duration}s)"
-    return 1
+    echo "$vvenc_cmd ${params[*]} --additional \"$additional_str\""
 }
 
 convert_segment_ffmpeg() {
@@ -308,9 +276,8 @@ convert_segment_ffmpeg() {
     
     local log_file="log_$(basename "$input" .mp4)_ffmpeg_attempt${attempt}.txt"
     
-    log_info "Usando FFmpeg fallback para: $(basename "$input")"
+    log_info "Usando FFmpeg para: $(basename "$input")"
     
-    # Redirigir errores MPP
     ffmpeg -i "$input" \
         -c:v libvvenc \
         -preset "$VVC_PRESET" \
@@ -319,11 +286,9 @@ convert_segment_ffmpeg() {
         -c:a "$AUDIO_ENCODER" \
         -b:a "$AUDIO_BITRATE" \
         -ac "$AUDIO_CHANNELS" \
-        -y "$output" 2>&1 | grep -v "mpp\|MPP" > "$log_file"
+        -y "$output" > "$log_file" 2>&1
     
-    local exit_code=${PIPESTATUS[0]}
-    
-    if [ $exit_code -eq 0 ] && [ -f "$output" ] && [ -s "$output" ]; then
+    if [ $? -eq 0 ] && [ -f "$output" ] && [ -s "$output" ]; then
         log_success "Convertido con FFmpeg"
         rm -f "$log_file"
         return 0
@@ -353,14 +318,7 @@ process_segment() {
     
     echo "[$segment_num/$total_segments] Procesando $base_name..."
     
-    for attempt in $(seq 1 $MAX_RETRIES); do
-        if convert_segment_vvc "$segment" "$output" "$attempt"; then
-            echo "success" > "$status_file"
-            return 0
-        fi
-        rm -f "$output" 2>/dev/null
-    done
-    
+    # Fallback a FFmpeg
     for attempt in $(seq 1 $MAX_RETRIES); do
         if convert_segment_ffmpeg "$segment" "$output" "$attempt"; then
             echo "success" > "$status_file"
@@ -374,42 +332,6 @@ process_segment() {
     return 1
 }
 
-monitor_processes() {
-    local pids=("$@")
-    local total=${#pids[@]}
-    local processed=0
-    local failed=0
-    
-    while [ ${#pids[@]} -gt 0 ]; do
-        local new_pids=()
-        
-        for pid in "${pids[@]}"; do
-            if kill -0 "$pid" 2>/dev/null; then
-                new_pids+=("$pid")
-            else
-                wait "$pid"
-                local exit_code=$?
-                ((processed++))
-                
-                if [ $exit_code -ne 0 ]; then
-                    ((failed++))
-                fi
-                
-                local progress=$((processed * 100 / total))
-                echo -ne "\rProgreso: $processed/$total segmentos ($progress%) | Fallos: $failed"
-            fi
-        done
-        
-        pids=("${new_pids[@]}")
-        sleep 1
-    done
-    
-    echo ""
-    log_info "Procesamiento completado"
-    log_info "Exitos: $((processed - failed))"
-    log_info "Fallos: $failed"
-}
-
 process_all_segments() {
     local segments=($(ls -1v segment_*.mp4 2>/dev/null))
     local total=${#segments[@]}
@@ -419,27 +341,43 @@ process_all_segments() {
         return 1
     fi
     
-    log_info "Procesando $total segmentos en paralelo ($PARALLEL_JOBS simultaneos)"
+    log_info "Procesando $total segmentos..."
     
-    local pids=()
+    local processed=0
+    local failed=0
     
+    # Procesar secuencialmente para evitar problemas
     for i in "${!segments[@]}"; do
         local segment="${segments[$i]}"
         local segment_num=$((i + 1))
         
-        while [ ${#pids[@]} -ge $PARALLEL_JOBS ]; do
-            sleep 1
-        done
+        # Mostrar progreso
+        local progress=$((segment_num * 100 / total))
+        echo -ne "\rProgreso: $segment_num/$total segmentos ($progress%)"
         
-        process_segment "$segment" "$segment_num" "$total" &
-        pids+=($!)
+        # Procesar segmento
+        if process_segment "$segment" "$segment_num" "$total"; then
+            ((processed++))
+        else
+            ((failed++))
+        fi
         
+        # Checkpoint
         if [ $((segment_num % BACKUP_EVERY)) -eq 0 ]; then
-            log_info "Checkpoint en segmento $segment_num"
+            echo ""
+            log_info "Checkpoint: $segment_num/$total procesados"
         fi
     done
     
-    monitor_processes "${pids[@]}"
+    echo ""
+    log_info "Procesamiento completado"
+    log_info "Exitos: $processed/$total"
+    log_info "Fallos: $failed/$total"
+    
+    if [ $processed -eq 0 ]; then
+        log_error "Ningun segmento se proceso exitosamente"
+        return 1
+    fi
     
     return 0
 }
@@ -449,37 +387,34 @@ merge_segments() {
     
     log_info "Uniendo segmentos convertidos..."
     
+    # Crear lista de archivos a unir
     local segment_list="segment_list.txt"
     > "$segment_list"
     
+    local converted_count=0
     for vvc_file in *_vvc.mp4; do
         if [ -f "$vvc_file" ] && [ -s "$vvc_file" ]; then
             if ffprobe -v error "$vvc_file" >/dev/null 2>&1; then
                 echo "file '$vvc_file'" >> "$segment_list"
+                ((converted_count++))
             fi
         fi
     done
     
-    local count=$(wc -l < "$segment_list" 2>/dev/null || echo 0)
-    
-    if [ "$count" -eq 0 ]; then
-        log_error "No hay segmentos para unir"
+    if [ $converted_count -eq 0 ]; then
+        log_error "No hay segmentos convertidos para unir"
         return 1
     fi
     
-    log_info "Uniendo $count segmentos..."
+    log_info "Uniendo $converted_count segmentos..."
     
-    # Redirigir errores MPP durante la union
+    # Unir segmentos
     ffmpeg -f concat \
         -safe 0 \
         -i "$segment_list" \
         -c copy \
         -y "$output" 2>&1 | \
-        while IFS= read -r line; do
-            if [[ "$line" == *"frame="* ]] || [[ "$line" == *"time="* ]]; then
-                echo "    $line"
-            fi
-        done
+        grep -E "frame=|time=|bitrate=" || true
     
     if [ -f "$output" ] && [ -s "$output" ]; then
         log_success "Video unido exitosamente"
@@ -503,19 +438,17 @@ cleanup_temp_files() {
 }
 
 check_disk_space() {
-    local required_gb=50
-    local available_gb=100  # Valor por defecto
+    local required_gb=30
+    local available_gb=100
     
-    # Obtener espacio disponible
     if command -v df &> /dev/null; then
-        available_gb=$(df -BG . 2>/dev/null | awk 'NR==2 {gsub("G","",$4); print $4}' || echo 100)
+        available_gb=$(df -BG . 2>/dev/null | awk 'NR==2 {gsub("G","",$4); print int($4)}' || echo 100)
     fi
     
     if [ "$available_gb" -lt "$required_gb" ]; then
         log_warning "Espacio en disco bajo: ${available_gb}GB disponibles"
         log_warning "Se recomienda al menos ${required_gb}GB"
-        log_warning "Continuando con espacio disponible..."
-        return 0  # Continuar de todos modos
+        log_warning "Continuando de todos modos..."
     fi
     
     return 0
@@ -546,7 +479,7 @@ main() {
     
     check_disk_space
     
-    # Configurar según preset
+    # Configurar segun preset
     case "$PRESET" in
         "fastest"|"fast")
             VVC_PRESET="fast"
@@ -564,20 +497,17 @@ main() {
             ;;
     esac
     
-    # Configurar para suprimir errores MPP
-    export MPP_LOG_LEVEL=0
-    
     HW_ACCEL=$(detect_hw_accel)
     
     get_video_info "$VIDEO_INPUT"
     
-    WORK_DIR="vvc_encode_$(date +%Y%m%d_%H%M%S)"
+    WORK_DIR="vvc_encode_tmp" # $(date +%Y%m%d_%H%M%S)" cambiado por tmp para recuperar trabajo desde una parada del comando
     mkdir -p "$WORK_DIR"
     cd "$WORK_DIR" || exit 1
     
     log_info "Directorio de trabajo: $WORK_DIR"
     
-    # Crear segmentos
+    # Crear segmentos - IMPORTANTE: sin usar HW_ACCEL que causa problemas
     if ! create_segments "$VIDEO_INPUT" "$SEGMENT_DURATION"; then
         log_error "Fallo al crear segmentos"
         cd ..
@@ -586,9 +516,7 @@ main() {
     
     # Procesar segmentos
     if ! process_all_segments; then
-        log_error "Fallo al procesar segmentos"
-        cd ..
-        exit 1
+        log_warning "Algunos segmentos fallaron, continuando..."
     fi
     
     # Unir segmentos
