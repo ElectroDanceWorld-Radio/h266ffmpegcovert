@@ -392,28 +392,17 @@ merge_segments() {
     > "$segment_list"
     
     local converted_count=0
-    local total_files=0
     
-    # Primero contar cuantos archivos hay
-    for vvc_file in *_vvc.mp4; do
-        if [ -f "$vvc_file" ]; then
-            ((total_files++))
-        fi
-    done
+    log_info "Buscando archivos *_vvc.mp4..."
     
-    log_info "Encontrados $total_files archivos *_vvc.mp4"
-    
-    # Ordenar archivos numericamente (segment_000_vvc.mp4, segment_001_vvc.mp4, etc.)
+    # Ordenar archivos numericamente
     for vvc_file in $(ls -1v segment_*_vvc.mp4 2>/dev/null | sort -V); do
         if [ -f "$vvc_file" ] && [ -s "$vvc_file" ]; then
             # Verificar que sea un video válido
             if ffprobe -v error "$vvc_file" >/dev/null 2>&1; then
-                # Usar ruta absoluta para evitar problemas
-                local absolute_path
-                absolute_path=$(realpath "$vvc_file" 2>/dev/null || echo "$vvc_file")
-                echo "file '$absolute_path'" >> "$segment_list"
+                echo "file '$vvc_file'" >> "$segment_list"
                 ((converted_count++))
-                log_info "  Agregado: $vvc_file"
+                log_info "  Agregado: $vvc_file ($converted_count)"
             else
                 log_warning "  Archivo inválido (saltando): $vvc_file"
             fi
@@ -422,26 +411,20 @@ merge_segments() {
     
     if [ $converted_count -eq 0 ]; then
         log_error "No hay segmentos convertidos válidos para unir"
-        # Intentar ver qué archivos hay
-        ls -la *_vvc.mp4 2>/dev/null | while read line; do
-            log_info "  $line"
-        done
         return 1
     fi
     
-    log_info "Preparando unión de $converted_count segmentos..."
-    
-    # Verificar que el archivo de lista no esté vacío
-    if [ ! -s "$segment_list" ]; then
-        log_error "El archivo de lista está vacío"
-        return 1
-    fi
+    log_info "Uniendo $converted_count segmentos..."
     
     # Mostrar primeras lineas del archivo de lista
-    log_info "Primeras lineas del archivo de lista:"
+    log_info "Archivo de lista contiene:"
     head -5 "$segment_list" | while read line; do
         log_info "  $line"
     done
+    
+    if [ $converted_count -gt 5 ]; then
+        log_info "  ... y $((converted_count - 5)) más"
+    fi
     
     # Crear directorio para el output si no existe
     local output_dir=$(dirname "$output")
@@ -451,118 +434,64 @@ merge_segments() {
     
     log_info "Iniciando union con FFmpeg..."
     
-    # Unir segmentos con más opciones de depuración
+    # Unir segmentos con FFmpeg
     local merge_log="merge_log.txt"
     local start_time=$(date +%s)
     
-    ffmpeg -f concat \
+    # IMPORTANTE: Usar comando sin -fflags que causó error
+    if ffmpeg -f concat \
         -safe 0 \
         -i "$segment_list" \
         -c copy \
-#        -movflags +faststart \ quitado por ser para web
-        -fflags +genpts \
-        -y "$output" 2>&1 | tee "$merge_log"
-    
-    local exit_code=${PIPESTATUS[0]}
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    
-    # Verificar resultado
-    if [ $exit_code -eq 0 ] && [ -f "$output" ] && [ -s "$output" ]; then
-        # Verificar que el archivo final sea válido
-        if ffprobe -v error "$output" >/dev/null 2>&1; then
-            local final_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
-            log_success "Video unido exitosamente en ${duration}s"
-            log_info "Tamaño del archivo final: $((final_size / 1048576)) MB"
-            
-            # Mostrar información del video final
-            local final_info=$(ffprobe -v error \
-                -show_entries format=duration,size,bit_rate \
-                -of default=noprint_wrappers=1 "$output" 2>/dev/null)
-            if [ -n "$final_info" ]; then
-                log_info "Información del video final:"
-                echo "$final_info" | while read line; do
-                    log_info "  $line"
-                done
-            fi
-            
-            rm -f "$merge_log" 2>/dev/null
-            rm -f "$segment_list" 2>/dev/null
-            return 0
-        else
-            log_error "El archivo final no es un video válido"
-        fi
-    else
-        log_error "Error al unir segmentos (código: $exit_code, tiempo: ${duration}s)"
+        -movflags +faststart \
+        -y "$output" 2> "$merge_log"; then
         
-        # Mostrar errores del log
-        if [ -f "$merge_log" ]; then
-            log_error "Errores de FFmpeg:"
-            grep -i "error\|fail\|invalid\|unsupported\|missing" "$merge_log" | head -10 | while read line; do
-                log_error "  $line"
-            done
-        fi
-    fi
-    
-    # Intentar método alternativo si falla
-    log_info "Intentando método alternativo de unión..."
-    
-    # Método alternativo: usar mkvmerge si está disponible
-    if command -v mkvmerge &> /dev/null; then
-        log_info "Usando mkvmerge como alternativa..."
-        
-        # Crear archivo .mkv temporal
-        local temp_mkv="${output%.*}.temp.mkv"
-        
-        # Construir lista de archivos para mkvmerge
-        local mkv_files=()
-        while IFS= read -r line; do
-            if [[ "$line" == file* ]]; then
-                local file_path=${line#file \'}
-                file_path=${file_path%\'}
-                mkv_files+=("$file_path")
-            fi
-        done < "$segment_list"
-        
-        if [ ${#mkv_files[@]} -gt 0 ]; then
-            if mkvmerge -o "$temp_mkv" "${mkv_files[@]}" 2>/dev/null; then
-                if [ -f "$temp_mkv" ] && [ -s "$temp_mkv" ]; then
-                    # Convertir de vuelta a mp4 si es necesario
-                    ffmpeg -i "$temp_mkv" -c copy -y "$output" 2>/dev/null
-                    if [ -f "$output" ] && [ -s "$output" ]; then
-                        log_success "Unión exitosa con mkvmerge"
-                        rm -f "$temp_mkv"
-                        return 0
-                    fi
-                fi
-            fi
-            rm -f "$temp_mkv" 2>/dev/null
-        fi
-    fi
-    
-    # Último intento: unir manualmente con cat (solo si los codecs son compatibles)
-    log_info "Intentando unión manual con cat..."
-    
-    # Crear archivo temporal
-    local temp_output="${output%.*}_temp.mp4"
-    
-    # Juntar todos los segmentos (solo para algunos formatos)
-    cat segment_*_vvc.mp4 > "$temp_output" 2>/dev/null
-    
-    if [ -f "$temp_output" ] && [ -s "$temp_output" ]; then
-        # Intentar reparar el archivo
-        ffmpeg -i "$temp_output" -c copy -y "$output" 2>&1 | grep -i "error\|warning" || true
+        local end_time=$(date +%s)
+        local duration=$((end_time - start_time))
         
         if [ -f "$output" ] && [ -s "$output" ]; then
             if ffprobe -v error "$output" >/dev/null 2>&1; then
-                log_success "Unión manual exitosa"
-                rm -f "$temp_output"
+                local final_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
+                log_success "Video unido exitosamente en ${duration}s"
+                log_info "Tamaño: $((final_size / 1048576)) MB"
+                rm -f "$merge_log"
+                rm -f "$segment_list"
                 return 0
             fi
         fi
-        rm -f "$temp_output"
     fi
     
+    # Si falla FFmpeg, intentar método manual con cat
+    log_warning "FFmpeg falló, intentando unión manual con cat..."
+    
+    # Unir manualmente con cat
+    local temp_output="${output%.*}_temp.mp4"
+    rm -f "$temp_output"
+    
+    for vvc_file in $(ls -1v segment_*_vvc.mp4 2>/dev/null | sort -V); do
+        if [ -f "$vvc_file" ] && [ -s "$vvc_file" ]; then
+            cat "$vvc_file" >> "$temp_output" 2>/dev/null
+        fi
+    done
+    
+    if [ -f "$temp_output" ] && [ -s "$temp_output" ]; then
+        # Intentar reparar con FFmpeg
+        log_info "Reparando archivo unido manualmente..."
+        if ffmpeg -i "$temp_output" -c copy -y "$output" 2>/dev/null; then
+            if [ -f "$output" ] && [ -s "$output" ]; then
+                if ffprobe -v error "$output" >/dev/null 2>&1; then
+                    log_success "Unión manual exitosa"
+                    rm -f "$temp_output"
+                    rm -f "$merge_log"
+                    rm -f "$segment_list"
+                    return 0
+                fi
+            fi
+        fi
+    fi
+    
+    log_error "Todos los métodos de unión fallaron"
+    rm -f "$temp_output" 2>/dev/null
     return 1
 }
 
