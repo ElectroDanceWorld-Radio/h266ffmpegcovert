@@ -432,13 +432,13 @@ merge_segments() {
         mkdir -p "$output_dir"
     fi
     
-    log_info "Iniciando union con FFmpeg..."
+    log_info "Iniciando union con FFmpeg (método principal)..."
     
     # Unir segmentos con FFmpeg
     local merge_log="merge_log.txt"
     local start_time=$(date +%s)
     
-    # IMPORTANTE: Usar comando sin -fflags que causó error
+    # PRIMER MÉTODO: FFmpeg con concat (el más confiable para MP4)
     if ffmpeg -f concat \
         -safe 0 \
         -i "$segment_list" \
@@ -451,23 +451,99 @@ merge_segments() {
         
         if [ -f "$output" ] && [ -s "$output" ]; then
             if ffprobe -v error "$output" >/dev/null 2>&1; then
-                local final_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
-                log_success "Video unido exitosamente en ${duration}s"
-                log_info "Tamaño: $((final_size / 1048576)) MB"
-                rm -f "$merge_log"
-                rm -f "$segment_list"
-                return 0
+                # Verificar duración
+                local final_duration=$(ffprobe -v error -show_entries format=duration \
+                    -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null)
+                local expected_duration=$((converted_count * SEGMENT_DURATION))
+                
+                log_info "Duración final: ${final_duration}s (esperada: ~${expected_duration}s)"
+                
+                if (( $(echo "$final_duration > $expected_duration * 0.9" | bc -l) )); then
+                    local final_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
+                    log_success "Video unido exitosamente en ${duration}s"
+                    log_info "Tamaño: $((final_size / 1048576)) MB"
+                    rm -f "$merge_log"
+                    rm -f "$segment_list"
+                    return 0
+                else
+                    log_warning "Duración incorrecta: ${final_duration}s (esperada: ~${expected_duration}s)"
+                fi
             fi
         fi
     fi
     
-    # Si falla FFmpeg, intentar método manual con cat
-    log_warning "FFmpeg falló, intentando unión manual con cat..."
+    # SEGUNDO MÉTODO: Usar el demuxer concat de FFmpeg (alternativa)
+    log_warning "Primer método falló, intentando con demuxer concat..."
     
-    # Unir manualmente con cat
+    # Crear archivo de texto con nombres de archivo
+    local concat_file="concat_list.txt"
+    > "$concat_file"
+    for vvc_file in $(ls -1v segment_*_vvc.mp4 2>/dev/null | sort -V); do
+        if [ -f "$vvc_file" ] && [ -s "$vvc_file" ]; then
+            echo "$vvc_file" >> "$concat_file"
+        fi
+    done
+    
+    # Usar el demuxer concat con pipes
+    if ffmpeg -f concat -safe 0 -i "$concat_file" \
+        -c copy \
+        -movflags +faststart \
+        -y "$output" 2> "$merge_log"; then
+        
+        if [ -f "$output" ] && [ -s "$output" ]; then
+            if ffprobe -v error "$output" >/dev/null 2>&1; then
+                local final_duration=$(ffprobe -v error -show_entries format=duration \
+                    -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null)
+                local expected_duration=$((converted_count * SEGMENT_DURATION))
+                
+                log_info "Duración final: ${final_duration}s (esperada: ~${expected_duration}s)"
+                
+                if (( $(echo "$final_duration > $expected_duration * 0.9" | bc -l) )); then
+                    log_success "Video unido exitosamente (método 2)"
+                    rm -f "$merge_log" "$concat_file" "$segment_list"
+                    return 0
+                fi
+            fi
+        fi
+    fi
+    
+    # TERCER MÉTODO: Usar mkvmerge si está disponible
+    if command -v mkvmerge &> /dev/null; then
+        log_info "Intentando con mkvmerge..."
+        
+        local temp_mkv="${output%.*}.temp.mkv"
+        local mkv_files=()
+        
+        for vvc_file in $(ls -1v segment_*_vvc.mp4 2>/dev/null | sort -V); do
+            if [ -f "$vvc_file" ] && [ -s "$vvc_file" ]; then
+                mkv_files+=("$vvc_file")
+            fi
+        done
+        
+        if [ ${#mkv_files[@]} -gt 0 ]; then
+            if mkvmerge -o "$temp_mkv" "${mkv_files[@]}" 2>/dev/null; then
+                # Convertir de MKV a MP4
+                if ffmpeg -i "$temp_mkv" -c copy -movflags +faststart -y "$output" 2>/dev/null; then
+                    if [ -f "$output" ] && [ -s "$output" ]; then
+                        if ffprobe -v error "$output" >/dev/null 2>&1; then
+                            log_success "Video unido exitosamente con mkvmerge"
+                            rm -f "$temp_mkv" "$merge_log" "$concat_file" "$segment_list"
+                            return 0
+                        fi
+                    fi
+                fi
+                rm -f "$temp_mkv" 2>/dev/null
+            fi
+        fi
+    fi
+    
+    # CUARTO MÉTODO: Unión manual con cat SOLO como último recurso
+    log_warning "Intentando unión manual con cat (puede causar problemas de duración)..."
+    
     local temp_output="${output%.*}_temp.mp4"
     rm -f "$temp_output"
     
+    # Crear archivo temporal unido
     for vvc_file in $(ls -1v segment_*_vvc.mp4 2>/dev/null | sort -V); do
         if [ -f "$vvc_file" ] && [ -s "$vvc_file" ]; then
             cat "$vvc_file" >> "$temp_output" 2>/dev/null
@@ -475,23 +551,38 @@ merge_segments() {
     done
     
     if [ -f "$temp_output" ] && [ -s "$temp_output" ]; then
-        # Intentar reparar con FFmpeg
         log_info "Reparando archivo unido manualmente..."
-        if ffmpeg -i "$temp_output" -c copy -y "$output" 2>/dev/null; then
+        
+        # Intentar reparar el archivo con FFmpeg
+        if ffmpeg -i "$temp_output" \
+            -c copy \
+            -movflags +faststart \
+            -fflags +genpts \
+            -y "$output" 2>/dev/null; then
+            
             if [ -f "$output" ] && [ -s "$output" ]; then
                 if ffprobe -v error "$output" >/dev/null 2>&1; then
-                    log_success "Unión manual exitosa"
-                    rm -f "$temp_output"
-                    rm -f "$merge_log"
-                    rm -f "$segment_list"
-                    return 0
+                    local final_duration=$(ffprobe -v error -show_entries format=duration \
+                        -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null)
+                    local expected_duration=$((converted_count * SEGMENT_DURATION))
+                    
+                    log_info "Duración final (reparada): ${final_duration}s"
+                    
+                    # Verificar si la duración es razonable
+                    if (( $(echo "$final_duration > $expected_duration * 0.7" | bc -l) )); then
+                        log_success "Unión manual reparada exitosamente"
+                        rm -f "$temp_output" "$merge_log" "$concat_file" "$segment_list"
+                        return 0
+                    else
+                        log_error "Duración incorrecta después de reparar: ${final_duration}s"
+                    fi
                 fi
             fi
         fi
     fi
     
     log_error "Todos los métodos de unión fallaron"
-    rm -f "$temp_output" 2>/dev/null
+    rm -f "$temp_output" "$merge_log" "$concat_file" "$segment_list" 2>/dev/null
     return 1
 }
 
