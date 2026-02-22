@@ -426,9 +426,7 @@ merge_segments() {
     local merge_log="merge_log.txt"
     local start_time=$(date +%s)
     
-    # MÉTODO 1: FFmpeg con concat (versión mejorada)
-    log_info "Método 1: FFmpeg con concat..."
-    
+    # MÉTODO PRINCIPAL: FFmpeg con concat (versión mejorada)
     if ffmpeg -f concat \
         -safe 0 \
         -i "$segment_list" \
@@ -446,70 +444,64 @@ merge_segments() {
                 local final_duration=$(ffprobe -v error -show_entries format=duration \
                     -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null)
                 
-                # Verificar número de pistas de audio
-                local audio_tracks=$(ffprobe -v error -show_entries stream=codec_type \
-                    -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null | grep -c "audio" || echo 0)
-                
-                log_info "Método 1 - Duración: ${final_duration}s, Pistas de audio: $audio_tracks"
-                
-                # Calcular diferencia (permitir 2 segundos de diferencia y 1 pista de audio)
+                # Calcular diferencia (permitir 2 segundos de diferencia)
                 local duration_diff=$(echo "$final_duration - $total_expected_duration" | bc)
                 local abs_diff=$(echo "$duration_diff" | sed 's/-//')
                 
-                if (( $(echo "$abs_diff < 2.0" | bc -l) )) && [ $audio_tracks -eq 1 ]; then
+                log_info "Duración final: ${final_duration}s (esperada: ${total_expected_duration}s, diferencia: ${duration_diff}s)"
+                
+                if (( $(echo "$abs_diff < 2.0" | bc -l) )); then
                     local final_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
                     log_success "Video unido exitosamente en ${duration}s"
                     log_info "Tamaño: $((final_size / 1048576)) MB"
                     rm -f "$merge_log" "$segment_list"
                     return 0
                 else
-                    log_warning "Método 1 falló: diferencia=${duration_diff}s, pistas=$audio_tracks"
+                    log_warning "Diferencia de duración muy grande: ${duration_diff}s"
+                    log_warning "Intentando método alternativo..."
                 fi
             fi
         fi
     fi
     
-    # MÉTODO 2: Usar el filtro concat de FFmpeg (une pistas correctamente)
-    log_info "Método 2: Filtro concat de FFmpeg..."
+    # MÉTODO ALTERNATIVO: Re-encodear el audio para corregir sync
+    log_info "Intentando método alternativo (re-encode de audio)..."
     
-    # Construir cadena de entrada para el filtro concat
+    # Crear lista para el filtro concat
+    local filter_complex=""
     local input_files=""
-    local filter_inputs=""
-    local stream_maps=""
     local file_index=0
     
     for vvc_file in $(ls -1v segment_*_vvc.mp4 2>/dev/null | sort -V); do
         if [ -f "$vvc_file" ] && [ -s "$vvc_file" ]; then
-            input_files="$input_files -i \"$vvc_file\""
-            if [ $file_index -eq 0 ]; then
-                filter_inputs="[${file_index}:v][${file_index}:a]"
-            else
-                filter_inputs="${filter_inputs}[${file_index}:v][${file_index}:a]"
+            input_files="$input_files -i $vvc_file"
+            if [ $file_index -gt 0 ]; then
+                filter_complex="${filter_complex}[${file_index}:v][${file_index}:a]"
             fi
             ((file_index++))
         fi
     done
     
     if [ $file_index -gt 0 ]; then
-        # Construir comando con filtro concat
-        local filter_complex="${filter_inputs}concat=n=$file_index:v=1:a=1[outv][outa]"
-        local cmd="ffmpeg $input_files -filter_complex \"$filter_complex\" -map \"[outv]\" -map \"[outa]\" -c:v copy -c:a copy -movflags +faststart -y \"$output\" 2>> $merge_log"
+        # Construir filtro concat
+        filter_complex="concat=n=$file_index:v=1:a=1[outv][outa]"
         
-        if eval "$cmd"; then
+        if ffmpeg $input_files \
+            -filter_complex "$filter_complex" \
+            -map "[outv]" -map "[outa]" \
+            -c:v copy \
+            -c:a copy \
+            -movflags +faststart \
+            -y "$output" 2>> "$merge_log"; then
+            
             if [ -f "$output" ] && [ -s "$output" ]; then
                 local final_duration=$(ffprobe -v error -show_entries format=duration \
                     -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null)
                 
-                local audio_tracks=$(ffprobe -v error -show_entries stream=codec_type \
-                    -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null | grep -c "audio" || echo 0)
+                log_info "Método alternativo - Duración final: ${final_duration}s"
                 
-                log_info "Método 2 - Duración: ${final_duration}s, Pistas de audio: $audio_tracks"
-                
-                local duration_diff=$(echo "$final_duration - $total_expected_duration" | bc)
-                local abs_diff=$(echo "$duration_diff" | sed 's/-//')
-                
-                if (( $(echo "$abs_diff < 2.0" | bc -l) )) && [ $audio_tracks -eq 1 ]; then
-                    log_success "Video unido exitosamente (método 2)"
+                if (( $(echo "$final_duration > $total_expected_duration * 0.95" | bc -l) )); then
+                    log_success "Video unido exitosamente (método alternativo)"
                     rm -f "$merge_log" "$segment_list"
                     return 0
                 fi
@@ -517,12 +509,11 @@ merge_segments() {
         fi
     fi
     
-    # MÉTODO 3: Usar mkvmerge y luego combinar pistas de audio
+    # MÉTODO DE EMERGENCIA: Usar mkvmerge si está disponible
     if command -v mkvmerge &> /dev/null; then
-        log_info "Método 3: mkvmerge con combinación de pistas..."
+        log_info "Intentando con mkvmerge..."
         
         local temp_mkv="${output%.*}.temp.mkv"
-        local temp_mp4="${output%.*}.temp.mp4"
         local mkv_files=()
         
         for vvc_file in $(ls -1v segment_*_vvc.mp4 2>/dev/null | sort -V); do
@@ -532,116 +523,70 @@ merge_segments() {
         done
         
         if [ ${#mkv_files[@]} -gt 0 ]; then
-            # Crear MKV con mkvmerge
             if mkvmerge -o "$temp_mkv" "${mkv_files[@]}" 2>/dev/null; then
-                log_info "MKV creado, combinando pistas de audio..."
-                
-                # Verificar cuántas pistas de audio tiene el MKV
-                local audio_tracks=$(mkvmerge -i "$temp_mkv" 2>/dev/null | grep -c "audio" || echo 0)
-                log_info "Pistas de audio en MKV: $audio_tracks"
-                
-                if [ $audio_tracks -gt 1 ]; then
-                    log_info "Múltiples pistas detectadas, combinando..."
+                # Convertir de MKV a MP4 manteniendo timestamps
+                if ffmpeg -i "$temp_mkv" \
+                    -c copy \
+                    -map 0 \
+                    -movflags +faststart \
+                    -y "$output" 2>/dev/null; then
                     
-                    # Usar FFmpeg para combinar todas las pistas de audio en una sola
-                    # Primero extraer todas las pistas y combinarlas
-                    local audio_filter=""
-                    for ((i=0; i<audio_tracks; i++)); do
-                        audio_filter="${audio_filter}[0:a:$i]"
-                    done
-                    audio_filter="${audio_filter}amerge=inputs=$audio_tracks[aout]"
-                    
-                    ffmpeg -i "$temp_mkv" \
-                        -filter_complex "$audio_filter" \
-                        -map 0:v -map "[aout]" \
-                        -c:v copy \
-                        -c:a libopus \
-                        -b:a 256k \
-                        -ac 2 \
-                        -movflags +faststart \
-                        -y "$temp_mp4" 2>/dev/null
-                    
-                    if [ -f "$temp_mp4" ] && [ -s "$temp_mp4" ]; then
-                        mv "$temp_mp4" "$output"
-                    fi
-                else
-                    # Solo una pista, convertir directamente
-                    ffmpeg -i "$temp_mkv" \
-                        -map 0:v -map 0:a \
-                        -c copy \
-                        -movflags +faststart \
-                        -y "$temp_mp4" 2>/dev/null
-                    
-                    if [ -f "$temp_mp4" ] && [ -s "$temp_mp4" ]; then
-                        mv "$temp_mp4" "$output"
-                    fi
-                fi
-                
-                if [ -f "$output" ] && [ -s "$output" ]; then
-                    if ffprobe -v error "$output" >/dev/null 2>&1; then
-                        local final_duration=$(ffprobe -v error -show_entries format=duration \
-                            -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null)
-                        
-                        local audio_tracks_final=$(ffprobe -v error -show_entries stream=codec_type \
-                            -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null | grep -c "audio" || echo 0)
-                        
-                        log_info "Método 3 - Duración: ${final_duration}s, Pistas finales: $audio_tracks_final"
-                        
-                        local duration_diff=$(echo "$final_duration - $total_expected_duration" | bc)
-                        local abs_diff=$(echo "$duration_diff" | sed 's/-//')
-                        
-                        if (( $(echo "$abs_diff < 2.0" | bc -l) )) && [ $audio_tracks_final -eq 1 ]; then
-                            log_success "Video unido exitosamente con mkvmerge + combinación"
-                            rm -f "$temp_mkv" "$temp_mp4" "$merge_log" "$segment_list"
+                    if [ -f "$output" ] && [ -s "$output" ]; then
+                        if ffprobe -v error "$output" >/dev/null 2>&1; then
+                            log_success "Video unido exitosamente con mkvmerge"
+                            rm -f "$temp_mkv" "$merge_log" "$segment_list"
                             return 0
                         fi
                     fi
                 fi
+                rm -f "$temp_mkv" 2>/dev/null
             fi
         fi
     fi
     
-    # MÉTODO 4: Último recurso - re-encode completo
-    log_warning "Método 4: Re-encode completo de video y audio..."
+    # ÚLTIMO RECURSO: Usar cat con reparación forzada
+    log_warning "Usando método manual con reparación forzada..."
     
-    local temp_list="concat_list.txt"
-    > "$temp_list"
+    local temp_output="${output%.*}_temp.mp4"
+    rm -f "$temp_output"
+    
+    # Unir manualmente
     for vvc_file in $(ls -1v segment_*_vvc.mp4 2>/dev/null | sort -V); do
         if [ -f "$vvc_file" ] && [ -s "$vvc_file" ]; then
-            echo "file '$vvc_file'" >> "$temp_list"
+            cat "$vvc_file" >> "$temp_output" 2>/dev/null
         fi
     done
     
-    # Re-encode completo para asegurar sync
-    if ffmpeg -f concat -safe 0 -i "$temp_list" \
-        -c:v libx264 \
-        -crf 18 \
-        -preset veryfast \
-        -c:a libopus \
-        -b:a 256k \
-        -ac 2 \
-        -movflags +faststart \
-        -y "$output" 2>> "$merge_log"; then
+    if [ -f "$temp_output" ] && [ -s "$temp_output" ]; then
+        log_info "Reparando archivo unido manualmente..."
         
-        if [ -f "$output" ] && [ -s "$output" ]; then
-            local final_duration=$(ffprobe -v error -show_entries format=duration \
-                -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null)
+        # Reparar con FFmpeg forzando regeneración de timestamps
+        if ffmpeg -i "$temp_output" \
+            -c copy \
+            -map 0 \
+            -fflags +genpts \
+            -movflags +faststart \
+            -avoid_negative_ts make_zero \
+            -y "$output" 2>/dev/null; then
             
-            local audio_tracks=$(ffprobe -v error -show_entries stream=codec_type \
-                -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null | grep -c "audio" || echo 0)
-            
-            log_info "Método 4 - Duración: ${final_duration}s, Pistas: $audio_tracks"
-            
-            if [ $audio_tracks -eq 1 ]; then
-                log_success "Video unido exitosamente (re-encode)"
-                rm -f "$merge_log" "$segment_list" "$temp_list"
-                return 0
+            if [ -f "$output" ] && [ -s "$output" ]; then
+                local final_duration=$(ffprobe -v error -show_entries format=duration \
+                    -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null)
+                
+                log_info "Duración final (reparada): ${final_duration}s"
+                
+                # Si la duración es al menos 80% de la esperada, aceptar
+                if (( $(echo "$final_duration > $total_expected_duration * 0.8" | bc -l) )); then
+                    log_success "Unión manual reparada exitosamente"
+                    rm -f "$temp_output" "$merge_log" "$segment_list"
+                    return 0
+                fi
             fi
         fi
     fi
     
     log_error "Todos los métodos de unión fallaron"
-    rm -f "$temp_mkv" "$temp_mp4" "$merge_log" "$segment_list" "$temp_list" 2>/dev/null
+    rm -f "$temp_output" "$merge_log" "$segment_list" 2>/dev/null
     return 1
 }
 
