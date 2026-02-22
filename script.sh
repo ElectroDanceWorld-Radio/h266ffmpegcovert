@@ -102,8 +102,14 @@ check_vvc_support() {
     return 0
 }
 
+# Función para obtener información del video - CORREGIDA
 get_video_info() {
     local video="$1"
+    
+    if [ ! -f "$video" ]; then
+        log_warning "Archivo no encontrado: $video"
+        return 1
+    fi
     
     log_info "Analizando: $(basename "$video")"
     
@@ -111,10 +117,32 @@ get_video_info() {
     echo "INFORMACION DEL VIDEO"
     echo "========================================"
     
-    ffprobe -v error \
+    # Obtener información del video
+    local video_info=$(ffprobe -v error \
         -show_entries stream=codec_name,codec_type,width,height,pix_fmt,bit_rate,r_frame_rate \
         -show_entries format=duration,size,bit_rate \
-        -of default=noprint_wrappers=1 "$video" 2>/dev/null
+        -of default=noprint_wrappers=1:nokey=0 "$video" 2>/dev/null)
+    
+    if [ -z "$video_info" ]; then
+        log_error "No se pudo obtener información del video"
+        return 1
+    fi
+    
+    echo "$video_info"
+    echo "----------------------------------------"
+    
+    # Mostrar resumen
+    local duration=$(ffprobe -v error -show_entries format=duration \
+        -of default=noprint_wrappers=1:nokey=1 "$video" 2>/dev/null)
+    local size=$(ffprobe -v error -show_entries format=size \
+        -of default=noprint_wrappers=1:nokey=1 "$video" 2>/dev/null)
+    
+    if [ -n "$duration" ] && [ -n "$size" ]; then
+        local minutes=$(echo "$duration / 60" | bc)
+        local seconds=$(echo "$duration % 60" | bc)
+        local size_mb=$((size / 1048576))
+        echo "RESUMEN: ${minutes}m ${seconds}s | ${size_mb}MB"
+    fi
 }
 
 create_segments() {
@@ -275,6 +303,7 @@ convert_segment_ffmpeg() {
     return 1
 }
 
+# Función para procesar segmentos - CORREGIDA para evitar duplicados
 process_segment() {
     local segment="$1"
     local segment_num="$2"
@@ -283,6 +312,12 @@ process_segment() {
     local base_name=$(basename "$segment" .mp4)
     local output="${base_name}_vvc.mp4"
     local status_file="${base_name}_status.txt"
+    
+    # Evitar procesar archivos que ya son _vvc
+    if [[ "$segment" == *_vvc.mp4 ]]; then
+        log_info "Saltando archivo ya convertido: $segment"
+        return 0
+    fi
     
     if [ -f "$output" ] && [ -s "$output" ]; then
         if ffprobe -v error "$output" >/dev/null 2>&1; then
@@ -310,8 +345,10 @@ process_segment() {
     return 1
 }
 
+# Actualizar también process_all_segments para evitar procesar archivos duplicados
 process_all_segments() {
-    local segments=($(ls -1v segment_*.mp4 2>/dev/null))
+    # Filtrar solo archivos segment_XXX.mp4 (no los _vvc)
+    local segments=($(ls -1v segment_*.mp4 2>/dev/null | grep -v "_vvc" | sort -V))
     local total=${#segments[@]}
     
     if [ $total -eq 0 ]; then
@@ -324,7 +361,6 @@ process_all_segments() {
     local processed=0
     local failed=0
     
-    # Procesar secuencialmente para evitar problemas
     for i in "${!segments[@]}"; do
         local segment="${segments[$i]}"
         local segment_num=$((i + 1))
@@ -360,6 +396,7 @@ process_all_segments() {
     return 0
 }
 
+# Función para unir segmentos - CORREGIDA
 merge_segments() {
     local output="$1"
     
@@ -372,28 +409,26 @@ merge_segments() {
     local converted_count=0
     local total_expected_duration=0
     
-    log_info "Buscando archivos *_vvc.mp4..."
+    log_info "Buscando archivos segment_*_vvc.mp4 (sin duplicados)..."
     
-    # Ordenar archivos numericamente
-    for vvc_file in $(ls -1v segment_*_vvc.mp4 2>/dev/null | sort -V); do
+    # Ordenar archivos numericamente y filtrar solo los que terminan en _vvc.mp4 (no _vvc_vvc.mp4)
+    for vvc_file in $(ls -1v segment_*_vvc.mp4 2>/dev/null | grep -v "_vvc_vvc" | sort -V); do
         if [ -f "$vvc_file" ] && [ -s "$vvc_file" ]; then
             # Verificar que sea un video válido
             if ffprobe -v error "$vvc_file" >/dev/null 2>&1; then
-                # Obtener duración del segmento usando awk para manejar decimales
+                # Obtener duración del segmento
                 local seg_duration=$(ffprobe -v error -show_entries format=duration \
-                    -of default=noprint_wrappers=1:nokey=1 "$vvc_file" 2>/dev/null | awk '{printf "%.3f", $1}')
+                    -of default=noprint_wrappers=1:nokey=1 "$vvc_file" 2>/dev/null)
                 
-                # Sumar usando awk para evitar problemas de bash con decimales
-                total_expected_duration=$(echo "$total_expected_duration $seg_duration" | awk '{printf "%.3f", $1 + $2}')
+                # Usar bc para sumar decimales
+                total_expected_duration=$(echo "$total_expected_duration + $seg_duration" | bc 2>/dev/null || echo "$total_expected_duration")
                 
-                # Usar ruta relativa (mejor para concat)
+                # Para FFmpeg concat, el formato debe ser EXACTAMENTE: file 'nombre.mp4'
                 echo "file '$vvc_file'" >> "$segment_list"
                 ((converted_count++))
                 log_info "  Agregado: $vvc_file (${seg_duration}s)"
             else
                 log_warning "  Archivo inválido (saltando): $vvc_file"
-                # Mostrar información del archivo inválido
-                ls -la "$vvc_file"
             fi
         fi
     done
@@ -414,197 +449,87 @@ merge_segments() {
     local merge_log="merge_log.txt"
     local start_time=$(date +%s)
     
-    # MÉTODO 1: Usar FFmpeg con concat (el más confiable)
+    # MÉTODO 1: FFmpeg con concat
     log_info "Método 1: FFmpeg concat..."
-    
-    # Asegurar que el archivo de lista tenga formato correcto
-    sed -i 's/^file //' "$segment_list" 2>/dev/null || true
-    
-    if ffmpeg -f concat \
-        -safe 0 \
-        -i "$segment_list" \
-        -c copy \
-        -map 0:v:0 -map 0:a:0 \
-        -fflags +genpts \
-        -movflags +faststart \
-        -y "$output" 2> "$merge_log"; then
-        
-        local end_time=$(date +%s)
-        local duration=$((end_time - start_time))
-        
+    if ffmpeg -f concat -safe 0 -i "$segment_list" -c copy -y "$output" 2> "$merge_log"; then
         if [ -f "$output" ] && [ -s "$output" ]; then
-            if ffprobe -v error "$output" >/dev/null 2>&1; then
-                # Verificar duración final
-                local final_duration=$(ffprobe -v error -show_entries format=duration \
-                    -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null | awk '{printf "%.3f", $1}')
-                
-                # Calcular diferencia usando awk
-                local diff=$(echo "$final_duration $total_expected_duration" | awk '{printf "%.3f", $1 - $2}')
-                local abs_diff=$(echo "$diff" | awk '{printf "%.3f", ($1 < 0) ? -$1 : $1}')
-                
-                log_info "Duración final: ${final_duration}s (esperada: ${total_expected_duration}s, diferencia: ${diff}s)"
-                
-                # Permitir hasta 5 segundos de diferencia (por redondeo)
-                if (( $(echo "$abs_diff < 5.0" | bc -l 2>/dev/null) )); then
-                    local final_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
-                    log_success "Video unido exitosamente en ${duration}s"
-                    log_info "Tamaño: $((final_size / 1048576)) MB"
-                    rm -f "$merge_log" "$segment_list"
-                    return 0
-                else
-                    log_warning "Diferencia de duración grande: ${diff}s"
-                fi
-            else
-                log_warning "Archivo de salida no es válido"
-            fi
-        else
-            log_warning "Archivo de salida no se creó correctamente"
-        fi
-    else
-        log_warning "FFmpeg concat falló"
-        # Mostrar errores
-        if [ -f "$merge_log" ]; then
-            tail -5 "$merge_log" | while read line; do
-                log_warning "  $line"
-            done
-        fi
-    fi
-    
-    # MÉTODO 2: Usar el filtro concat de FFmpeg
-    log_info "Método 2: FFmpeg filter concat..."
-    
-    # Construir cadena de entrada
-    local input_files=""
-    local filter_complex=""
-    local file_index=0
-    
-    for vvc_file in $(ls -1v segment_*_vvc.mp4 2>/dev/null | sort -V); do
-        if [ -f "$vvc_file" ] && [ -s "$vvc_file" ]; then
-            input_files="$input_files -i \"$vvc_file\""
-            ((file_index++))
-        fi
-    done
-    
-    if [ $file_index -gt 0 ]; then
-        # Construir filtro concat
-        filter_complex="concat=n=$file_index:v=1:a=1[outv][outa]"
-        
-        # Ejecutar FFmpeg con filter_complex
-        eval ffmpeg $input_files \
-            -filter_complex \"$filter_complex\" \
-            -map \"[outv]\" -map \"[outa]\" \
-            -c:v copy \
-            -c:a copy \
-            -movflags +faststart \
-            -y \"$output\" 2>> "$merge_log"
-        
-        if [ $? -eq 0 ] && [ -f "$output" ] && [ -s "$output" ]; then
-            if ffprobe -v error "$output" >/dev/null 2>&1; then
-                local final_duration=$(ffprobe -v error -show_entries format=duration \
-                    -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null)
-                log_success "Video unido exitosamente (método filter concat)"
+            local final_duration=$(ffprobe -v error -show_entries format=duration \
+                -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null)
+            if [ -n "$final_duration" ] && [ "$(echo "$final_duration > 0" | bc 2>/dev/null)" = "1" ]; then
+                log_success "Video unido exitosamente con FFmpeg concat"
+                local end_time=$(date +%s)
+                local duration=$((end_time - start_time))
+                local final_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
+                log_info "Tiempo: ${duration}s | Tamaño: $((final_size / 1048576))MB | Duración: ${final_duration}s"
                 rm -f "$merge_log" "$segment_list"
                 return 0
             fi
         fi
     fi
     
-    # MÉTODO 3: Usar mkvmerge (pero asegurando que el archivo final sea válido)
+    # MÉTODO 2: mkvmerge (el que funcionó antes)
     if command -v mkvmerge &> /dev/null; then
-        log_info "Método 3: mkvmerge..."
+        log_info "Método 2: mkvmerge..."
         
         local temp_mkv="${output%.*}.temp.mkv"
         local mkv_files=()
         
-        for vvc_file in $(ls -1v segment_*_vvc.mp4 2>/dev/null | sort -V); do
+        # Usar la misma lista filtrada
+        for vvc_file in $(ls -1v segment_*_vvc.mp4 2>/dev/null | grep -v "_vvc_vvc" | sort -V); do
             if [ -f "$vvc_file" ] && [ -s "$vvc_file" ]; then
                 mkv_files+=("$vvc_file")
             fi
         done
         
         if [ ${#mkv_files[@]} -gt 0 ]; then
-            # Unir con mkvmerge
-            if mkvmerge -o "$temp_mkv" "${mkv_files[@]}" > /dev/null 2>&1; then
-                if [ -f "$temp_mkv" ] && [ -s "$temp_mkv" ]; then
-                    # Convertir de MKV a MP4
-                    if ffmpeg -i "$temp_mkv" \
-                        -c copy \
-                        -map 0:v:0 -map 0:a:0 \
-                        -movflags +faststart \
-                        -y "$output" 2>/dev/null; then
-                        
-                        if [ -f "$output" ] && [ -s "$output" ]; then
-                            if ffprobe -v error "$output" >/dev/null 2>&1; then
-                                log_success "Video unido exitosamente con mkvmerge"
-                                rm -f "$temp_mkv" "$merge_log" "$segment_list"
-                                return 0
-                            fi
+            # Crear MKV
+            if mkvmerge -o "$temp_mkv" "${mkv_files[@]}" 2>/dev/null; then
+                # Convertir MKV a MP4
+                if ffmpeg -i "$temp_mkv" -c copy -map 0 -y "$output" 2>/dev/null; then
+                    if [ -f "$output" ] && [ -s "$output" ]; then
+                        local final_duration=$(ffprobe -v error -show_entries format=duration \
+                            -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null)
+                        if [ -n "$final_duration" ] && [ "$(echo "$final_duration > 0" | bc 2>/dev/null)" = "1" ]; then
+                            log_success "Video unido exitosamente con mkvmerge"
+                            local end_time=$(date +%s)
+                            local duration=$((end_time - start_time))
+                            local final_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
+                            log_info "Tiempo: ${duration}s | Tamaño: $((final_size / 1048576))MB | Duración: ${final_duration}s"
+                            rm -f "$temp_mkv" "$merge_log" "$segment_list"
+                            return 0
                         fi
                     fi
                 fi
-            fi
-            rm -f "$temp_mkv" 2>/dev/null
-        fi
-    fi
-    
-    # MÉTODO 4: Unir manualmente con cat y reparar
-    log_warning "Método 4: Unión manual con cat..."
-    
-    local temp_output="${output%.*}_temp.mp4"
-    rm -f "$temp_output"
-    
-    # Unir manualmente
-    for vvc_file in $(ls -1v segment_*_vvc.mp4 2>/dev/null | sort -V); do
-        if [ -f "$vvc_file" ] && [ -s "$vvc_file" ]; then
-            cat "$vvc_file" >> "$temp_output" 2>/dev/null
-        fi
-    done
-    
-    if [ -f "$temp_output" ] && [ -s "$temp_output" ]; then
-        log_info "Reparando archivo unido manualmente..."
-        
-        # Intentar reparar con FFmpeg
-        if ffmpeg -i "$temp_output" \
-            -c copy \
-            -map 0:v:0 -map 0:a:0 \
-            -fflags +genpts \
-            -movflags +faststart \
-            -y "$output" 2>/dev/null; then
-            
-            if [ -f "$output" ] && [ -s "$output" ]; then
-                if ffprobe -v error "$output" >/dev/null 2>&1; then
-                    local final_duration=$(ffprobe -v error -show_entries format=duration \
-                        -of default=noprint_wrappers=1:nokey=1 "$output" 2>/dev/null)
-                    
-                    log_info "Duración final (reparada): ${final_duration}s"
-                    
-                    # Aceptar si la duración es razonable
-                    local min_expected=$(echo "$total_expected_duration * 0.8" | bc -l 2>/dev/null)
-                    if (( $(echo "$final_duration > $min_expected" | bc -l 2>/dev/null) )); then
-                        log_success "Unión manual reparada exitosamente"
-                        rm -f "$temp_output" "$merge_log" "$segment_list"
-                        return 0
-                    fi
-                fi
+                rm -f "$temp_mkv" 2>/dev/null
             fi
         fi
     fi
     
     log_error "Todos los métodos de unión fallaron"
-    rm -f "$temp_output" "$merge_log" "$segment_list" 2>/dev/null
+    rm -f "$merge_log" "$segment_list" 2>/dev/null
     return 1
 }
 
+# Función de limpieza - CORREGIDA para preguntar
 cleanup_temp_files() {
-    log_info "Limpiando archivos temporales..."
-    
-    rm -f segment_*.mp4 2>/dev/null
-    rm -f *_vvc.mp4 2>/dev/null
-    rm -f segment_list.txt 2>/dev/null
-    rm -f status_*.txt 2>/dev/null
-    rm -f log_*.txt 2>/dev/null
-    
-    log_success "Limpieza completada"
+    echo ""
+    read -p "¿Eliminar archivos temporales? (s/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Ss]$ ]]; then
+        log_info "Limpiando archivos temporales..."
+        rm -f segment_*.mp4 2>/dev/null
+        rm -f *_vvc.mp4 2>/dev/null
+        rm -f segment_list.txt 2>/dev/null
+        rm -f status_*.txt 2>/dev/null
+        rm -f log_*.txt 2>/dev/null
+        rm -f ffmpeg_segment.log 2>/dev/null
+        rm -f merge_log.txt 2>/dev/null
+        rm -f *.temp.mkv 2>/dev/null
+        rm -f *_temp.mp4 2>/dev/null
+        log_success "Limpieza completada"
+    else
+        log_info "Archivos temporales conservados"
+    fi
 }
 
 check_disk_space() {
@@ -671,7 +596,7 @@ main() {
     
     get_video_info "$VIDEO_INPUT"
     
-    WORK_DIR="vvc_encode_tmp" # $(date +%Y%m%d_%H%M%S)" cambiado por tmp para recuperar trabajo desde una parada del comando
+    WORK_DIR="vvc_encode_tmp"
     mkdir -p "$WORK_DIR"
     cd "$WORK_DIR" || exit 1
     
@@ -696,34 +621,39 @@ main() {
         echo "========================================"
         echo "✅ COMPRESION COMPLETADA"
         echo "========================================"
-        get_video_info "$VIDEO_OUTPUT"
         
-        local original_size=$(stat -c%s "$VIDEO_INPUT" 2>/dev/null || echo 0)
-        local compressed_size=$(stat -c%s "$VIDEO_OUTPUT" 2>/dev/null || echo 0)
-        
-        echo ""
-        echo "ESTADISTICAS FINALES:"
-        echo "--------------------"
-        echo "Tamaño original: $((original_size / 1048576)) MB"
-        echo "Tamaño comprimido: $((compressed_size / 1048576)) MB"
-        
-        if [ "$original_size" -gt 0 ] && [ "$compressed_size" -gt 0 ]; then
-            local ratio=$(echo "scale=2; $original_size / $compressed_size" | bc 2>/dev/null || echo "N/A")
-            echo "Ratio de compresion: ${ratio}x"
-        fi
-        
-        echo ""
-        
-        read -p "Eliminar archivos temporales? (s/n): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Ss]$ ]]; then
-            cleanup_temp_files
-            rm -rf "$WORK_DIR"
-            log_success "Archivos temporales eliminados"
+        # Verificar que el archivo existe antes de analizar
+        if [ -f "$VIDEO_OUTPUT" ] && [ -s "$VIDEO_OUTPUT" ]; then
+            get_video_info "$VIDEO_OUTPUT"
+            
+            local original_size=$(stat -c%s "$VIDEO_INPUT" 2>/dev/null || echo 0)
+            local compressed_size=$(stat -c%s "$VIDEO_OUTPUT" 2>/dev/null || echo 0)
+            
+            echo ""
+            echo "ESTADISTICAS FINALES:"
+            echo "--------------------"
+            echo "Tamaño original: $((original_size / 1048576)) MB"
+            echo "Tamaño comprimido: $((compressed_size / 1048576)) MB"
+            
+            if [ "$original_size" -gt 0 ] && [ "$compressed_size" -gt 0 ]; then
+                local ratio=$(echo "scale=2; $original_size / $compressed_size" | bc 2>/dev/null || echo "N/A")
+                echo "Ratio de compresion: ${ratio}x"
+            fi
+            
+            # Mostrar duración final
+            local final_duration=$(ffprobe -v error -show_entries format=duration \
+                -of default=noprint_wrappers=1:nokey=1 "$VIDEO_OUTPUT" 2>/dev/null)
+            if [ -n "$final_duration" ]; then
+                local minutes=$(echo "$final_duration / 60" | bc)
+                local seconds=$(echo "$final_duration % 60" | bc)
+                echo "Duración final: ${minutes}m ${seconds}s"
+            fi
         else
-            log_info "Archivos temporales conservados en: $WORK_DIR"
+            log_error "El archivo de salida no se creó correctamente"
         fi
         
+        echo ""
+        cleanup_temp_files
     else
         log_error "Error en la union de segmentos"
         cd ..
