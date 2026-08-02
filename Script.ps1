@@ -140,10 +140,12 @@ function New-Segments {
     )
     Write-Info "Creando segmentos de ${Duration}s..."
     
-    # Verificar si ya hay segmentos
-    if (Test-Path "segment_*.mp4") {
-        $count = (Get-ChildItem "segment_*.mp4").Count
-        Write-Info "Segmentos ya existen ($count encontrados), saltando creación"
+    # Verificar solo segmentos originales (patrón segment_XXX.mp4)
+    $originalSegments = Get-ChildItem "segment_*.mp4" -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match '^segment_\d{3}\.mp4$'
+    }
+    if ($originalSegments.Count -gt 0) {
+        Write-Info "Segmentos originales ya existen ($($originalSegments.Count) encontrados), saltando creación"
         return $true
     }
     
@@ -159,9 +161,11 @@ function New-Segments {
         -segment_start_number 0 `
         "segment_%03d.mp4" 2>$null
     
-    $count = (Get-ChildItem "segment_*.mp4" -ErrorAction SilentlyContinue).Count
-    if ($count -gt 0) {
-        Write-Success "Creados $count segmentos"
+    $originalSegments = Get-ChildItem "segment_*.mp4" -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match '^segment_\d{3}\.mp4$'
+    }
+    if ($originalSegments.Count -gt 0) {
+        Write-Success "Creados $($originalSegments.Count) segmentos"
         return $true
     }
     
@@ -180,9 +184,11 @@ function New-Segments {
             "segment_%03d.mp4" 2>$tempLog
     } catch {}
     
-    $count = (Get-ChildItem "segment_*.mp4" -ErrorAction SilentlyContinue).Count
-    if ($count -gt 0) {
-        Write-Success "Creados $count segmentos"
+    $originalSegments = Get-ChildItem "segment_*.mp4" -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match '^segment_\d{3}\.mp4$'
+    }
+    if ($originalSegments.Count -gt 0) {
+        Write-Success "Creados $($originalSegments.Count) segmentos"
         Remove-Item $tempLog -ErrorAction SilentlyContinue
         return $true
     }
@@ -350,10 +356,14 @@ function Invoke-ProcessSegment {
 }
 
 function Invoke-ProcessAllSegments {
-    $segments = Get-ChildItem "segment_*.mp4" | Sort-Object Name
+    # Solo los segmentos originales (formato segment_000.mp4, no _vvc.mp4)
+    $segments = Get-ChildItem "segment_*.mp4" | Where-Object {
+        $_.Name -match '^segment_\d{3}\.mp4$'
+    } | Sort-Object Name
+    
     $total = $segments.Count
     if ($total -eq 0) {
-        Write-ErrorLog "No se encontraron segmentos"
+        Write-ErrorLog "No se encontraron segmentos originales para procesar"
         return $false
     }
     
@@ -395,40 +405,46 @@ function Invoke-ProcessAllSegments {
 function Merge-Segments {
     param([string]$OutputFile)
     Write-Info "Uniendo segmentos convertidos..."
-    
+
     $segmentList = "segment_list.txt"
-    "" | Out-File -FilePath $segmentList
-    
-    $convertedCount = 0
-    Get-ChildItem "*_vvc.mp4" | ForEach-Object {
-        if ($_.Length -gt 0) {
-            ffprobe -v error $_.FullName 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                "file '$($_.FullName)'" | Out-File -FilePath $segmentList -Append
-                $convertedCount++
-            }
-        }
-    }
-    
+    # Aseguramos que el archivo esté vacío (ASCII, sin BOM)
+    [System.IO.File]::WriteAllText($segmentList, "", [System.Text.Encoding]::ASCII)
+
+    # Buscar solo los segmentos convertidos con formato segment_NNN_vvc.mp4
+    $convertedSegments = Get-ChildItem "*_vvc.mp4" | Where-Object {
+        $_.Name -match '^segment_\d{3}_vvc\.mp4$'
+    } | Sort-Object Name
+
+    $convertedCount = $convertedSegments.Count
     if ($convertedCount -eq 0) {
         Write-ErrorLog "No hay segmentos convertidos para unir"
         return $false
     }
-    
+
+    # Escribir la lista con rutas absolutas y saltos de línea Unix
+    foreach ($seg in $convertedSegments) {
+        $line = "file '$($seg.FullName -replace '\\','/')'"
+        [System.IO.File]::AppendAllText($segmentList, $line + "`n", [System.Text.Encoding]::ASCII)
+    }
+
     Write-Info "Uniendo $convertedCount segmentos..."
-    
-    $output = ffmpeg -f concat `
-        -safe 0 `
-        -i $segmentList `
-        -c copy `
-        -y $OutputFile 2>&1 | Select-String "frame=|time=|bitrate="
-    if ($output) { $output | ForEach-Object { Write-Host $_ } }
-    
-    if ((Test-Path $OutputFile) -and ((Get-Item $OutputFile).Length -gt 0)) {
+
+    # Ejecutar ffmpeg y capturar toda la salida (stdout + stderr)
+    $ffmpegOutput = & ffmpeg -f concat -safe 0 -i $segmentList -c copy -y $OutputFile 2>&1
+    $exitCode = $LASTEXITCODE
+
+    # Mostrar solo líneas de progreso, pero guardar todo en un log por si hay error
+    $ffmpegOutput | Select-String "frame=|time=|bitrate=|error|Error" | ForEach-Object { Write-Host $_ }
+
+    # Verificar éxito
+    if ($exitCode -eq 0 -and (Test-Path $OutputFile) -and ((Get-Item $OutputFile).Length -gt 0)) {
         Write-Success "Video unido exitosamente"
         return $true
     } else {
-        Write-ErrorLog "Error al unir segmentos"
+        # Mostrar las últimas 20 líneas de ffmpeg para diagnosticar
+        Write-Host "Últimas líneas de FFmpeg (error):" -ForegroundColor Yellow
+        $ffmpegOutput | Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+        Write-ErrorLog "Error al unir segmentos (código de salida: $exitCode)"
         return $false
     }
 }
