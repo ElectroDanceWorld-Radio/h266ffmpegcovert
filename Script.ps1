@@ -71,12 +71,12 @@ function Write-Success {
 
 function Write-Warning {
     param([string]$Message)
-    Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] WARNING: $Message"
+    Microsoft.PowerShell.Utility\Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] WARNING: $Message"
 }
 
-function Write-ErrorLog {
+function Write-WarningLog {
     param([string]$Message)
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR: $Message" -ForegroundColor Red
+    Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] WARNING: $Message"
 }
 
 function Get-HardwareAcceleration {
