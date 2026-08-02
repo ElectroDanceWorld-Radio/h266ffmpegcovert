@@ -519,8 +519,10 @@ function Main {
             Write-Warning "Algunos segmentos fallaron, continuando..."
         }
         
-        # Unir segmentos (salida relativa a directorio original)
-        $outputPath = Join-Path (Resolve-Path "..") $VideoOutput
+        # Usar directamente la ruta absoluta de salida
+        $outputPath = $VideoOutput
+        # Crear la carpeta de salida si no existe
+        New-Item -ItemType Directory -Force -Path (Split-Path $outputPath) | Out-Null
         if (Merge-Segments -OutputFile $outputPath) {
             Pop-Location
             Write-Host ""
