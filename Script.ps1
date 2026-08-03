@@ -406,11 +406,7 @@ function Merge-Segments {
     param([string]$OutputFile)
     Write-Info "Uniendo segmentos convertidos..."
 
-    $segmentList = "segment_list.txt"
-    # Aseguramos que el archivo esté vacío (ASCII, sin BOM)
-    [System.IO.File]::WriteAllText($segmentList, "", [System.Text.Encoding]::ASCII)
-
-    # Buscar solo los segmentos convertidos con formato segment_NNN_vvc.mp4
+    # Buscar segmentos convertidos (formato segment_NNN_vvc.mp4)
     $convertedSegments = Get-ChildItem "*_vvc.mp4" | Where-Object {
         $_.Name -match '^segment_\d{3}_vvc\.mp4$'
     } | Sort-Object Name
@@ -420,6 +416,54 @@ function Merge-Segments {
         Write-ErrorLog "No hay segmentos convertidos para unir"
         return $false
     }
+
+    # Crear lista con ruta absoluta
+    $segmentList = Join-Path -Path (Get-Location) -ChildPath "segment_list.txt"
+
+    # Escribir las rutas absolutas de los segmentos (con barra normal para evitar problemas en Windows)
+    $lines = $convertedSegments | ForEach-Object {
+        "file '$($_.FullName -replace '\\','/')'"
+    }
+    # Guardar en ASCII con saltos de línea Unix (solo LF)
+    [System.IO.File]::WriteAllLines($segmentList, $lines, [System.Text.Encoding]::ASCII)
+
+    # Verificar que el archivo existe y no está vacío
+    if (-not (Test-Path $segmentList)) {
+        Write-ErrorLog "No se pudo crear la lista de segmentos en: $segmentList"
+        return $false
+    }
+    if ((Get-Item $segmentList).Length -eq 0) {
+        Write-ErrorLog "La lista de segmentos está vacía"
+        return $false
+    }
+
+    Write-Info "Uniendo $convertedCount segmentos..."
+
+    # Ejecutar ffmpeg usando una lista de argumentos (evita problemas con rutas y espacios)
+    $ffmpegArgs = @(
+        "-f", "concat",
+        "-safe", "0",
+        "-i", $segmentList,
+        "-c", "copy",
+        "-y", $OutputFile
+    )
+    $ffmpegOutput = & ffmpeg $ffmpegArgs 2>&1
+    $exitCode = $LASTEXITCODE
+
+    # Mostrar solo líneas de progreso
+    $ffmpegOutput | Select-String "frame=|time=|bitrate=|error|Error" | ForEach-Object { Write-Host $_ }
+
+    if ($exitCode -eq 0 -and (Test-Path $OutputFile) -and ((Get-Item $OutputFile).Length -gt 0)) {
+        Write-Success "Video unido exitosamente"
+        return $true
+    } else {
+        # Mostrar últimas líneas para diagnóstico
+        Write-Host "`nÚltimas líneas de FFmpeg (error):" -ForegroundColor Yellow
+        $ffmpegOutput | Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+        Write-ErrorLog "Error al unir segmentos (código de salida: $exitCode)"
+        return $false
+    }
+}
 
     # Escribir la lista con rutas absolutas y saltos de línea Unix
     foreach ($seg in $convertedSegments) {
