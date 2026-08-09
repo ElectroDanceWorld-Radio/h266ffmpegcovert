@@ -465,34 +465,6 @@ function Merge-Segments {
     }
 }
 
-    # Escribir la lista con rutas absolutas y saltos de línea Unix
-    foreach ($seg in $convertedSegments) {
-        $line = "file '$($seg.FullName -replace '\\','/')'"
-        [System.IO.File]::AppendAllText($segmentList, $line + "`n", [System.Text.Encoding]::ASCII)
-    }
-
-    Write-Info "Uniendo $convertedCount segmentos..."
-
-    # Ejecutar ffmpeg y capturar toda la salida (stdout + stderr)
-    $ffmpegOutput = & ffmpeg -f concat -safe 0 -i $segmentList -c copy -y $OutputFile 2>&1
-    $exitCode = $LASTEXITCODE
-
-    # Mostrar solo líneas de progreso, pero guardar todo en un log por si hay error
-    $ffmpegOutput | Select-String "frame=|time=|bitrate=|error|Error" | ForEach-Object { Write-Host $_ }
-
-    # Verificar éxito
-    if ($exitCode -eq 0 -and (Test-Path $OutputFile) -and ((Get-Item $OutputFile).Length -gt 0)) {
-        Write-Success "Video unido exitosamente"
-        return $true
-    } else {
-        # Mostrar las últimas 20 líneas de ffmpeg para diagnosticar
-        Write-Host "Últimas líneas de FFmpeg (error):" -ForegroundColor Yellow
-        $ffmpegOutput | Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
-        Write-ErrorLog "Error al unir segmentos (código de salida: $exitCode)"
-        return $false
-    }
-}
-
 function Clear-TempFiles {
     Write-Info "Limpiando archivos temporales..."
     Remove-Item "segment_*.mp4" -ErrorAction SilentlyContinue
