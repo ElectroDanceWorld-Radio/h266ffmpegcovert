@@ -512,7 +512,8 @@ function Main {
         exit 1
     }
     
-    if (-not (Test-VvcSupport)) {
+    $vvcOk = Test-VvcSupport
+    if (-not $vvcOk) {
         Write-ErrorLog "VVC no disponible"
         exit 1
     }
@@ -536,6 +537,7 @@ function Main {
     $WORK_DIR = "vvc_encode_tmp"
     New-Item -ItemType Directory -Force -Path $WORK_DIR | Out-Null
     Push-Location $WORK_DIR
+    $workDirAbsolute = (Get-Location).Path
     Write-Info "Directorio de trabajo: $WORK_DIR"
     
     try {
@@ -594,7 +596,7 @@ function Main {
     }
     finally {
         # Asegurar regresar al directorio original
-        if ((Get-Location).Path -eq (Resolve-Path $WORK_DIR).Path) {
+        if ((Get-Location).Path -eq $workDirAbsolute) {
             Pop-Location
         }
     }
