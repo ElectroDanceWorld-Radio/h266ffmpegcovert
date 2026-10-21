@@ -18,7 +18,7 @@
 #>
 
 param(
-    [string]$VideoInput = "C:\Users\Carlos\Videos\Convertir\VID_20251114_190822.mp4",
+    [string]$VideoInput = "D:\Users\Public\Videos\Convertir\VID_20260515_010739_00_006(360).mov",
     [string]$VideoOutput = "C:\Users\Carlos\Videos\Convertir\VID_20251114_190822_h266.mp4",
     [string]$Preset = "slower",
     [int]$SegmentDuration = 30
@@ -134,107 +134,71 @@ function Get-VideoInfo {
 }
 
 function New-Segments {
-    param(
-        [string]$InputFile,
-        [int]$Duration
-    )
+    param([string]$InputFile, [int]$Duration)
     Write-Info "Creando segmentos de ${Duration}s..."
-    
-    # Verificar solo segmentos originales (patrón segment_XXX.mp4)
-    $originalSegments = Get-ChildItem "segment_*.mp4" -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -match '^segment_\d{3}\.mp4$'
-    }
-    if ($originalSegments.Count -gt 0) {
-        Write-Info "Segmentos originales ya existen ($($originalSegments.Count) encontrados), saltando creación"
+
+    # Detectar códec de vídeo de origen
+    $srcCodec = (& ffprobe -v error -select_streams v:0 `
+        -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 `
+        "$InputFile" 2>$null) | Out-String
+    $srcCodec = $srcCodec.Trim()
+
+    # ProRes/DNxHD/FFV1/Huffyuv no caben bien en MP4: usar .mov
+    $segExt = if ($srcCodec -in @("prores","dnxhd","dnxhr","ffv1","huffyuv","rawvideo")) { "mov" } else { "mp4" }
+    Write-Info "Códec origen: $srcCodec → segmentos en .$segExt"
+
+    if (Test-Path "segment_*.$segExt") {
+        $count = (Get-ChildItem "segment_*.$segExt").Count
+        Write-Info "Segmentos ya existen ($count), saltando creación"
         return $true
     }
-    
-    # Método 1: Simple sin redirección de logs
-    Write-Info "Intentando método simple..."
-    
+
+    # Duración total
+    $durStr = & ffprobe -v error -show_entries format=duration `
+        -of default=noprint_wrappers=1:nokey=1 "$InputFile" 2>$null
+    $totalDuration = [math]::Floor([double]$durStr)
+    if ($totalDuration -le 0) { $totalDuration = 0 }
+    $expectedSegments = if ($totalDuration -gt 0) { [math]::Ceiling($totalDuration / $Duration) } else { 0 }
+
+    # Método 1: segmentación directa
     ffmpeg -loglevel quiet -i "$InputFile" `
-        -c copy `
-        -f segment `
+        -c copy -f segment `
         -segment_time "$Duration" `
-        -segment_format mp4 `
+        -segment_format $segExt `
         -reset_timestamps 1 `
         -segment_start_number 0 `
-        "segment_%03d.mp4" 2>$null
-    
-    $originalSegments = Get-ChildItem "segment_*.mp4" -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -match '^segment_\d{3}\.mp4$'
-    }
-    if ($originalSegments.Count -gt 0) {
-        Write-Success "Creados $($originalSegments.Count) segmentos"
+        "segment_%03d.$segExt" 2>$null
+
+    $count = (Get-ChildItem "segment_*.$segExt" -ErrorAction SilentlyContinue).Count
+
+    # Validación: si esperábamos muchos segmentos y solo hay 1 → método falló
+    if ($count -gt 1 -or ($count -eq 1 -and $expectedSegments -le 1)) {
+        Write-Success "Creados $count segmentos"
         return $true
     }
-    
-    # Método 2: Con redirección de errores a archivo
-    Write-Info "Intentando con redirección de errores..."
-    
-    $tempLog = "ffmpeg_segment.log"
-    try {
-        ffmpeg -i "$InputFile" `
-            -c copy `
-            -f segment `
-            -segment_time "$Duration" `
-            -segment_format mp4 `
-            -reset_timestamps 1 `
-            -segment_start_number 0 `
-            "segment_%03d.mp4" 2>$tempLog
-    } catch {}
-    
-    $originalSegments = Get-ChildItem "segment_*.mp4" -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -match '^segment_\d{3}\.mp4$'
-    }
-    if ($originalSegments.Count -gt 0) {
-        Write-Success "Creados $($originalSegments.Count) segmentos"
-        Remove-Item $tempLog -ErrorAction SilentlyContinue
-        return $true
-    }
-    
-    # Método 3: Crear segmentos uno por uno
-    Write-Info "Creando segmentos manualmente..."
-    
-    $durationStr = & ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$InputFile" 2>$null
-    $totalDuration = [math]::Floor([double]$durationStr)
-    if ($totalDuration -le 0) {
-        $totalDuration = 2166
-    }
-    
-    $segmentCount = [math]::Ceiling($totalDuration / $Duration)
-    Write-Info "Duración total: ${totalDuration}s, creando $segmentCount segmentos..."
-    
-    $createdCount = 0
+
+    Write-WarningLog "Segmentación con -c copy produjo $count segmento(s) para $expectedSegments esperados. Reintentando manualmente..."
+
+    # Limpiar parciales
+    Remove-Item "segment_*.$segExt" -ErrorAction SilentlyContinue
+
+    # Método 2: cortes manuales uno por uno
+    $segmentCount = $expectedSegments
+    if ($segmentCount -le 0) { Write-ErrorLog "No se pudo obtener duración"; return $false }
+
+    Write-Info "Creando $segmentCount segmentos manualmente (esto puede tardar)..."
+    $created = 0
     for ($i = 0; $i -lt $segmentCount; $i++) {
         $start = $i * $Duration
-        $segmentName = "segment_{0:D3}.mp4" -f $i
-        
-        if ($i % 10 -eq 0) {
-            Write-Info "Creando segmento $($i+1)/$segmentCount..."
-        }
-        
-        ffmpeg -loglevel quiet -i "$InputFile" `
-            -ss "$start" `
-            -t "$Duration" `
-            -c copy `
-            -avoid_negative_ts make_zero `
-            -y "$segmentName" 2>$null
-        
-        if ((Test-Path $segmentName) -and ((Get-Item $segmentName).Length -gt 0)) {
-            $createdCount++
-        } else {
-            Remove-Item $segmentName -ErrorAction SilentlyContinue
-        }
+        $name = "segment_{0:D3}.$segExt" -f $i
+        if ($i % 5 -eq 0) { Write-Info "Segmento $($i+1)/$segmentCount ..." }
+        ffmpeg -loglevel quiet -ss $start -i "$InputFile" `
+            -t $Duration -c copy -avoid_negative_ts make_zero `
+            -y "$name" 2>$null
+        if ((Test-Path $name) -and (Get-Item $name).Length -gt 0) { $created++ }
     }
-    
-    if ($createdCount -gt 0) {
-        Write-Success "Creados $createdCount/$segmentCount segmentos"
-        return $true
-    } else {
-        Write-ErrorLog "No se pudieron crear segmentos"
-        return $false
-    }
+    Write-Info "Creados $created/$segmentCount segmentos"
+    return ($created -gt 0)
 }
 
 function Build-VvcCommand {
@@ -290,9 +254,16 @@ function Convert-SegmentFfmpeg {
     
     Write-Info "Usando FFmpeg para: $(Split-Path $InputSegment -Leaf)"
     
+    # Asegurar salida .mp4 (contenedor compatible con VVC + Opus)
+    if ([System.IO.Path]::GetExtension($OutputSegment).ToLower() -ne ".mp4") {
+        $OutputSegment = [System.IO.Path]::ChangeExtension($OutputSegment, ".mp4")
+    }
+    
     $threadCount = $env:NUMBER_OF_PROCESSORS
-    if (-not $threadCount) { $threadCount = (Get-WmiObject Win32_ComputerSystem).NumberOfLogicalProcessors }
-    if (-not $threadCount) { $threadCount = 4 } # fallback
+    if (-not $threadCount) {
+        $threadCount = (Get-WmiObject Win32_ComputerSystem).NumberOfLogicalProcessors
+    }
+    if (-not $threadCount) { $threadCount = 4 }  # fallback
     
     $argList = @(
         "-i", "`"$InputSegment`"",
@@ -315,7 +286,114 @@ function Convert-SegmentFfmpeg {
         Remove-Item $logFile -ErrorAction SilentlyContinue
         return $true
     }
+    
+    # Mostrar últimas líneas del log cuando falla, para diagnóstico
+    if (Test-Path $logFile) {
+        Write-WarningLog "Falló FFmpeg en $base (intento $Attempt). Últimas líneas del log:"
+        Get-Content $logFile -Tail 15 -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+    }
     return $false
+}
+
+
+function Invoke-ProcessAllSegments {
+    # Aceptar segmentos .mp4 (fuentes H.264/HEVC/AV1) y .mov (ProRes/DNxHD/FFV1, etc.)
+    $segments = Get-ChildItem "segment_*.mp4","segment_*.mov" -ErrorAction SilentlyContinue |
+                Sort-Object Name
+    $total = $segments.Count
+    if ($total -eq 0) {
+        Write-ErrorLog "No se encontraron segmentos (.mp4 o .mov)"
+        return $false
+    }
+    
+    Write-Info "Procesando $total segmentos..."
+    $processed = 0
+    $failed = 0
+    
+    for ($i = 0; $i -lt $total; $i++) {
+        $segment = $segments[$i].FullName
+        $segmentNum = $i + 1
+        
+        $progress = [math]::Floor($segmentNum * 100 / $total)
+        Write-Host -NoNewline "`rProgreso: $segmentNum/$total segmentos ($progress%)"
+        
+        if (Invoke-ProcessSegment -Segment $segment -SegmentNum $segmentNum -TotalSegments $total) {
+            $processed++
+        } else {
+            $failed++
+        }
+        
+        if ($segmentNum % $BACKUP_EVERY -eq 0) {
+            Write-Host ""
+            Write-Info "Checkpoint: $segmentNum/$total procesados"
+        }
+    }
+    
+    Write-Host ""
+    Write-Info "Procesamiento completado"
+    Write-Info "Exitos: $processed/$total"
+    Write-Info "Fallos: $failed/$total"
+    
+    if ($processed -eq 0) {
+        Write-ErrorLog "Ningún segmento se procesó exitosamente"
+        return $false
+    }
+    return $true
+}
+
+
+function Merge-Segments {
+    param([string]$OutputFile)
+    Write-Info "Uniendo segmentos convertidos..."
+    
+    # El audio Opus solo se admite en MP4 (no en MOV/AVI). Corregir extensión si es necesario.
+    $outExt = [System.IO.Path]::GetExtension($OutputFile).ToLower()
+    if ($AUDIO_ENCODER -eq "libopus" -and $outExt -ne ".mp4") {
+        $newOutput = [System.IO.Path]::ChangeExtension($OutputFile, ".mp4")
+        Write-WarningLog "Contenedor '$outExt' incompatible con audio Opus. Cambiando a: $(Split-Path $newOutput -Leaf)"
+        $OutputFile = $newOutput
+    }
+    
+    $segmentList = "segment_list.txt"
+    "" | Out-File -FilePath $segmentList -Encoding ASCII
+    
+    $convertedCount = 0
+    Get-ChildItem "*_vvc.mp4" | Sort-Object Name | ForEach-Object {
+        if ($_.Length -gt 0) {
+            ffprobe -v error $_.FullName 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                "file '$($_.FullName)'" | Out-File -FilePath $segmentList -Append -Encoding ASCII
+                $convertedCount++
+            }
+        }
+    }
+    
+    if ($convertedCount -eq 0) {
+        Write-ErrorLog "No hay segmentos convertidos para unir"
+        return $false
+    }
+    
+    Write-Info "Uniendo $convertedCount segmentos en: $(Split-Path $OutputFile -Leaf)"
+    
+    $logMerge = "merge_ffmpeg.log"
+    $mergeCmd = "ffmpeg -f concat -safe 0 -i `"$segmentList`" -c copy -y `"$OutputFile`""
+    Invoke-Expression "$mergeCmd > `"$logMerge`" 2>&1"
+    
+    if ((Test-Path $OutputFile) -and ((Get-Item $OutputFile).Length -gt 0)) {
+        # Mostrar resumen del log (líneas con frame/time/bitrate si existen)
+        Get-Content $logMerge -ErrorAction SilentlyContinue |
+            Select-String "frame=|time=|bitrate=" |
+            ForEach-Object { Write-Host $_ }
+        Remove-Item $logMerge -ErrorAction SilentlyContinue
+        Write-Success "Video unido exitosamente"
+        return $true
+    } else {
+        Write-ErrorLog "Error al unir segmentos. Últimas líneas de FFmpeg:"
+        Get-Content $logMerge -Tail 25 -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+        return $false
+    }
 }
 
 function Invoke-ProcessSegment {
@@ -357,7 +435,7 @@ function Invoke-ProcessSegment {
 
 function Invoke-ProcessAllSegments {
     # Solo los segmentos originales (formato segment_000.mp4, no _vvc.mp4)
-    $segments = Get-ChildItem "segment_*.mp4" | Where-Object {
+    $segments = Get-ChildItem "segment_*.mp4","segment_*.mov" -ErrorAction SilentlyContinue | Sort-Object Name {
         $_.Name -match '^segment_\d{3}\.mp4$'
     } | Sort-Object Name
     
@@ -388,6 +466,7 @@ function Invoke-ProcessAllSegments {
             Write-Host ""
             Write-Info "Checkpoint: $segmentNum/$total procesados"
         }
+
     }
     
     Write-Host ""
@@ -608,7 +687,17 @@ function Main {
 # Manejar interrupción (Ctrl+C)
 try {
     Main
-} catch {
-    Write-Warning "Interrupción recibida, guardando estado..."
+} try {
+    Main
+}
+catch [System.Management.Automation.PipelineStoppedException] {
+    Write-Host ""
+    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] INTERRUMPIDO por el usuario (Ctrl+C)." -ForegroundColor Yellow
+    exit 130
+}
+catch {
+    Write-Host ""
+    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR FATAL: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Línea: $($_.InvocationInfo.ScriptLineNumber) — $($_.InvocationInfo.Line.Trim())" -ForegroundColor DarkGray
     exit 1
 }
