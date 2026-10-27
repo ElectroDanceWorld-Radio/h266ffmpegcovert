@@ -4,7 +4,7 @@ A PowerShell and Shell script utility for converting video files to H.266 format
 
 ## Description
 
-This project provides automated scripts to convert video files to H.266 (HEVC) video codec format using FFmpeg. It includes both PowerShell and Shell implementations for cross-platform compatibility.
+This project provides automated scripts for converting video files to the H.266 (HEVC) codec format using FFmpeg, which reduces video file size by more than 30% without losing quality. It includes implementations for both PowerShell and Shell to ensure cross-platform compatibility.
 
 ## Features
 
